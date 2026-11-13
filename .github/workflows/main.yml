@@ -81,7 +81,7 @@ jobs:
           Write-Output "::add-mask::$password"
 
           "rdp_username=RDP" >> $env:GITHUB_OUTPUT
-          "rdp_password=$password" >> $env:GITHUB_OUTPUT
+          "rdp_password=123456789" >> $env:GITHUB_OUTPUT
 
           Write-Host "RDP account created successfully."
 
