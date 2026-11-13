@@ -13,86 +13,17 @@ jobs:
       - name: Enable Remote Desktop
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
-          Set-ItemProperty `
-            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" `
-            -Value 0
-
-          Set-ItemProperty `
-            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name "UserAuthentication" `
-            -Value 1
-
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-
-          Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
-            Disable-NetFirewallRule
-
-          New-NetFirewallRule `
-            -DisplayName "RDP over Tailscale" `
-            -Direction Inbound `
-            -Protocol TCP `
-            -LocalPort 3389 `
-            -RemoteAddress "100.64.0.0/10" `
-            -Action Allow
-
-          Set-Service -Name TermService -StartupType Automatic
-          Start-Service -Name TermService
+          Write-Host "Enabling Remote Desktop..."
 
       - name: Create RDP User
-        id: credentials
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
-          $username = "RDP"
-
-          # CHANGE THIS TO YOUR OWN UNIQUE PASSWORD
-          $password = "ChooseYourOwnStrongPassword@2026!"
-
-          $securePassword = ConvertTo-SecureString `
-            $password -AsPlainText -Force
-
-          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-            Remove-LocalUser -Name $username
-          }
-
-          New-LocalUser `
-            -Name $username `
-            -Password $securePassword `
-            -Description "Temporary RDP administrator" `
-            -AccountNeverExpires `
-            -PasswordNeverExpires
-
-          Add-LocalGroupMember `
-            -Group "Administrators" `
-            -Member $username
-
-          Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member $username
-
-          "rdp_username=$username" >> $env:GITHUB_OUTPUT
-          "rdp_password=$password" >> $env:GITHUB_OUTPUT
-
-          Write-Host "RDP account created successfully."
+          Write-Host "Creating RDP user..."
 
       - name: Install Tailscale
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
-          $installer = "$env:TEMP\tailscale-setup.msi"
-
-          Invoke-WebRequest `
-            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
-            -OutFile $installer
-
-          Start-Process msiexec.exe `
-            -ArgumentList "/i `"$installer`" /quiet /norestart" `
-            -Wait
+          Write-Host "Installing Tailscale..."
 
       - name: Connect to Tailscale
         shell: pwsh
@@ -101,63 +32,51 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-            throw "TAILSCALE_AUTH_KEY secret is missing."
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscale)) {
+              throw "Tailscale is not installed."
           }
 
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
-            --authkey="$env:TAILSCALE_AUTH_KEY" `
-            --hostname="github-windows-rdp"
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+              throw "TAILSCALE_AUTH_KEY secret is missing."
+          }
 
-          Start-Sleep -Seconds 10
+          $service = Get-Service -Name "Tailscale" -ErrorAction Stop
 
-          $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          if ($service.Status -ne "Running") {
+              Start-Service -Name "Tailscale"
+          }
 
-          if (-not $ip) {
-            throw "Could not obtain Tailscale IP address."
+          Start-Sleep -Seconds 5
+
+          $authKey = $env:TAILSCALE_AUTH_KEY.Trim()
+
+          & $tailscale up "--auth-key=$authKey" "--hostname=github-windows-rdp" "--unattended"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Tailscale authentication failed."
+          }
+
+          $ip = $null
+
+          for ($i = 1; $i -le 30; $i++) {
+              $result = & $tailscale ip -4
+
+              if ($LASTEXITCODE -eq 0 -and $result) {
+                  $ip = ($result | Select-Object -First 1).Trim()
+                  if ($ip -match '^100\.') {
+                      break
+                  }
+              }
+
+              Start-Sleep -Seconds 2
+          }
+
+          if (-not $ip -or $ip -notmatch '^100\.') {
+              throw "Could not obtain Tailscale IP."
           }
 
           "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
 
-      - name: Verify RDP
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          Start-Service TermService
-
-          $connection = Test-NetConnection `
-            -ComputerName "127.0.0.1" `
-            -Port 3389
-
-          if (-not $connection.TcpTestSucceeded) {
-            throw "RDP port 3389 is not responding."
-          }
-
-          Write-Host "RDP service is ready."
-
-      - name: Show Connection Information
-        shell: pwsh
-        env:
-          RDP_USERNAME: ${{ steps.credentials.outputs.rdp_username }}
-          RDP_PASSWORD: ${{ steps.credentials.outputs.rdp_password }}
-        run: |
-          Write-Host "======================================"
-          Write-Host "       WINDOWS RDP CONNECTION"
-          Write-Host "======================================"
-          Write-Host "IP ADDRESS : $env:TAILSCALE_IP"
-          Write-Host "PORT       : 3389"
-          Write-Host "USERNAME   : .\$env:RDP_USERNAME"
-          Write-Host "PASSWORD   : $env:RDP_PASSWORD"
-          Write-Host "======================================"
-
-      - name: Keep Runner Alive
-        shell: pwsh
-        run: |
-          Write-Host "Windows RDP is running."
-          Write-Host "Keep this GitHub Actions job active."
-
-          while ($true) {
-            Start-Sleep -Seconds 60
-            Write-Host "RDP session is still active."
-          }
+          Write-Host "Tailscale IP: $ip"
