@@ -19,24 +19,25 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Enable RDP
+          Write-Host "Configuring Remote Desktop..."
+
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' -Value 0
+            -Name 'fDenyTSConnections' `
+            -Value 0
 
-          # Keep Network Level Authentication enabled
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'UserAuthentication' -Value 1
+            -Name 'UserAuthentication' `
+            -Value 1
 
-          # Disable existing broad RDP firewall rules
           Get-NetFirewallRule -DisplayGroup "Remote Desktop" `
             -ErrorAction SilentlyContinue |
             Disable-NetFirewallRule
 
-          # Allow RDP only from the Tailscale IPv4 range
-          Remove-NetFirewallRule -DisplayName "RDP-Tailscale" `
-            -ErrorAction SilentlyContinue
+          Get-NetFirewallRule -DisplayName "RDP-Tailscale" `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
 
           New-NetFirewallRule `
             -DisplayName "RDP-Tailscale" `
@@ -47,9 +48,10 @@ jobs:
             -Action Allow `
             -Profile Any
 
-          # Ensure the RDP service is running
           Set-Service -Name TermService -StartupType Automatic
           Start-Service -Name TermService
+
+          Write-Host "Remote Desktop configured."
 
       # 2. Create the RDP administrator account
       - name: Create RDP User
@@ -59,32 +61,64 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD) -or
-              $env:RDP_PASSWORD.Length -lt 16) {
-              throw "RDP_PASSWORD must contain at least 16 characters."
+          $username = "RDP"
+          $password = $env:RDP_PASSWORD
+
+          if ([string]::IsNullOrWhiteSpace($password)) {
+              throw "RDP_PASSWORD GitHub secret is missing."
           }
+
+          if ($password.Length -lt 16) {
+              throw "RDP password must contain at least 16 characters."
+          }
+
+          if (
+              $password -cnotmatch '[A-Z]' -or
+              $password -cnotmatch '[a-z]' -or
+              $password -notmatch '[0-9]' -or
+              $password -notmatch '[^a-zA-Z0-9]'
+          ) {
+              throw "Password must contain uppercase, lowercase, numbers and special characters."
+          }
+
+          Write-Host "Password format validation passed."
 
           $securePassword = ConvertTo-SecureString `
-            $env:RDP_PASSWORD -AsPlainText -Force
+              -String $password `
+              -AsPlainText `
+              -Force
 
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
-              Remove-LocalUser -Name "RDP"
+          # Remove an existing account if present
+          $existingUser = Get-LocalUser `
+              -Name $username `
+              -ErrorAction SilentlyContinue
+
+          if ($existingUser) {
+              Remove-LocalUser -Name $username
+              Write-Host "Existing RDP account removed."
           }
 
-          New-LocalUser `
-            -Name "RDP" `
-            -Password $securePassword `
-            -Description "Temporary RDP administrator" `
-            -AccountNeverExpires `
-            -PasswordNeverExpires
+          # Create the local administrator
+          try {
+              New-LocalUser `
+                  -Name $username `
+                  -Password $securePassword `
+                  -Description "Temporary RDP administrator" `
+                  -AccountNeverExpires `
+                  -PasswordNeverExpires `
+                  -ErrorAction Stop | Out-Null
+          }
+          catch {
+              throw "Windows rejected the RDP password. Check Windows password policy and your RDP_PASSWORD secret. Details: $($_.Exception.Message)"
+          }
 
           Add-LocalGroupMember `
-            -Group "Administrators" `
-            -Member "RDP"
+              -Group "Administrators" `
+              -Member $username
 
           Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member "RDP"
+              -Group "Remote Desktop Users" `
+              -Member $username
 
           Write-Host "RDP administrator created successfully."
 
@@ -96,25 +130,32 @@ jobs:
 
           $installer = "$env:TEMP\tailscale.msi"
 
+          Write-Host "Downloading Tailscale..."
+
           Invoke-WebRequest `
-            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
-            -OutFile $installer
+              -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+              -OutFile $installer
 
-          Start-Process msiexec.exe `
-            -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" `
-            -Wait
+          $process = Start-Process msiexec.exe `
+              -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" `
+              -Wait `
+              -PassThru
 
-          Remove-Item $installer -Force
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+
+          if ($process.ExitCode -notin @(0, 3010)) {
+              throw "Tailscale installation failed. Exit code: $($process.ExitCode)"
+          }
 
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          if (!(Test-Path $tailscale)) {
-              throw "Tailscale installation failed."
+          if (-not (Test-Path $tailscale)) {
+              throw "Tailscale executable was not found."
           }
 
           Write-Host "Tailscale installed successfully."
 
-      # 4. Connect to your Tailscale network
+      # 4. Connect to Tailscale
       - name: Connect Tailscale
         shell: pwsh
         env:
@@ -124,38 +165,66 @@ jobs:
 
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-              throw "TAILSCALE_AUTH_KEY is missing."
+          if (-not (Test-Path $tailscale)) {
+              throw "Tailscale executable not found."
           }
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+              throw "TAILSCALE_AUTH_KEY GitHub secret is missing."
+          }
+
+          Write-Host "Starting Tailscale service..."
+
+          $service = Get-Service -Name "Tailscale" -ErrorAction Stop
+
+          if ($service.Status -ne "Running") {
+              Start-Service -Name "Tailscale"
+          }
+
+          Start-Sleep -Seconds 5
+
+          Write-Host "Connecting to Tailscale..."
 
           & $tailscale up `
-            "--authkey=$env:TAILSCALE_AUTH_KEY" `
-            "--hostname=gh-rdp-$env:GITHUB_RUN_ID"
+              "--auth-key=$($env:TAILSCALE_AUTH_KEY)" `
+              "--hostname=gh-rdp-$env:GITHUB_RUN_ID" `
+              "--unattended"
 
           if ($LASTEXITCODE -ne 0) {
-              throw "Failed to connect to Tailscale."
+              throw "Tailscale authentication failed. Check your authentication key."
           }
 
-          # Retrieve the assigned IPv4 address
+          # Wait for the assigned Tailscale IP
           $tsIP = $null
 
-          for ($i = 0; $i -lt 20; $i++) {
-              $tsIP = (& $tailscale ip -4 | Select-Object -First 1).Trim()
+          for ($i = 1; $i -le 30; $i++) {
 
-              if ($tsIP -match '^100\.') {
-                  break
+              $result = & $tailscale ip -4 2>$null
+
+              if ($LASTEXITCODE -eq 0 -and $result) {
+                  $candidate = ($result | Select-Object -First 1).Trim()
+
+                  if ($candidate -match '^100\.') {
+                      $tsIP = $candidate
+                      break
+                  }
               }
 
-              Start-Sleep -Seconds 5
+              Write-Host "Waiting for Tailscale IP ($i/30)..."
+              Start-Sleep -Seconds 2
           }
 
-          if ($tsIP -notmatch '^100\.') {
+          if (-not $tsIP) {
               throw "Tailscale IP assignment failed."
           }
 
-          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          "TAILSCALE_IP=$tsIP" | Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Append `
+              -Encoding utf8
 
           Write-Host "Tailscale connected successfully."
+          Write-Host "Tailscale IP: $tsIP"
 
       # 5. Verify RDP service
       - name: Verify RDP
@@ -163,37 +232,39 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "Checking RDP service..."
+          Write-Host "Checking Remote Desktop service..."
 
-          $service = Get-Service TermService
+          $service = Get-Service -Name TermService
 
           if ($service.Status -ne "Running") {
               throw "Remote Desktop service is not running."
           }
 
           $test = Test-NetConnection `
-            -ComputerName "127.0.0.1" `
-            -Port 3389 `
-            -WarningAction SilentlyContinue
+              -ComputerName "127.0.0.1" `
+              -Port 3389 `
+              -WarningAction SilentlyContinue
 
-          if (!$test.TcpTestSucceeded) {
+          if (-not $test.TcpTestSucceeded) {
               throw "RDP port 3389 is not responding."
           }
 
           Write-Host "RDP service is ready."
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
 
-      # 6. Maintain the RDP session
+      # 6. Display connection information and keep runner active
       - name: Keep Windows VPS Running
         shell: pwsh
+        env:
+          RDP_USERNAME: RDP
         run: |
           Write-Host ""
           Write-Host "======================================"
           Write-Host "       WINDOWS RDP VPS READY"
           Write-Host "======================================"
           Write-Host "Address:  $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: Your RDP_PASSWORD secret"
+          Write-Host "Username: .\$env:RDP_USERNAME"
+          Write-Host "Password: Your GitHub RDP_PASSWORD secret"
           Write-Host "Port:     3389"
           Write-Host "======================================"
 
