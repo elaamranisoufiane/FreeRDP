@@ -1,5 +1,46 @@
 
-      # 2. Create RDP User
+name: Windows RDP VPS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      - name: Enable Remote Desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
+            Disable-NetFirewallRule
+
+          New-NetFirewallRule `
+            -DisplayName "RDP over Tailscale" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Action Allow
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
       - name: Create RDP User
         id: credentials
         shell: pwsh
@@ -7,7 +48,9 @@
           $ErrorActionPreference = "Stop"
 
           $username = "RDP"
-          $password = "Morocco@RDP2026!Secure"
+
+          # CHANGE THIS TO YOUR OWN UNIQUE PASSWORD
+          $password = "ChooseYourOwnStrongPassword@2026!"
 
           $securePassword = ConvertTo-SecureString `
             $password -AsPlainText -Force
@@ -23,11 +66,98 @@
             -AccountNeverExpires `
             -PasswordNeverExpires
 
-          Add-LocalGroupMember -Group "Administrators" -Member $username
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member $username
 
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $username
 
           "rdp_username=$username" >> $env:GITHUB_OUTPUT
           "rdp_password=$password" >> $env:GITHUB_OUTPUT
 
           Write-Host "RDP account created successfully."
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installer = "$env:TEMP\tailscale-setup.msi"
+
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $installer
+
+          Start-Process msiexec.exe `
+            -ArgumentList "/i `"$installer`" /quiet /norestart" `
+            -Wait
+
+      - name: Connect to Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "TAILSCALE_AUTH_KEY secret is missing."
+          }
+
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey="$env:TAILSCALE_AUTH_KEY" `
+            --hostname="github-windows-rdp"
+
+          Start-Sleep -Seconds 10
+
+          $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+
+          if (-not $ip) {
+            throw "Could not obtain Tailscale IP address."
+          }
+
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+      - name: Verify RDP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Start-Service TermService
+
+          $connection = Test-NetConnection `
+            -ComputerName "127.0.0.1" `
+            -Port 3389
+
+          if (-not $connection.TcpTestSucceeded) {
+            throw "RDP port 3389 is not responding."
+          }
+
+          Write-Host "RDP service is ready."
+
+      - name: Show Connection Information
+        shell: pwsh
+        env:
+          RDP_USERNAME: ${{ steps.credentials.outputs.rdp_username }}
+          RDP_PASSWORD: ${{ steps.credentials.outputs.rdp_password }}
+        run: |
+          Write-Host "======================================"
+          Write-Host "       WINDOWS RDP CONNECTION"
+          Write-Host "======================================"
+          Write-Host "IP ADDRESS : $env:TAILSCALE_IP"
+          Write-Host "PORT       : 3389"
+          Write-Host "USERNAME   : .\$env:RDP_USERNAME"
+          Write-Host "PASSWORD   : $env:RDP_PASSWORD"
+          Write-Host "======================================"
+
+      - name: Keep Runner Alive
+        shell: pwsh
+        run: |
+          Write-Host "Windows RDP is running."
+          Write-Host "Keep this GitHub Actions job active."
+
+          while ($true) {
+            Start-Sleep -Seconds 60
+            Write-Host "RDP session is still active."
+          }
