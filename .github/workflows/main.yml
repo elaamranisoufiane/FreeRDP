@@ -1,11 +1,19 @@
-
 name: Windows RDP VPS
 
 on:
   workflow_dispatch:
+    inputs:
+      client_tailscale_ip:
+        description: "Tailscale IP of your client device (for connectivity test)"
+        required: false
+        default: "100.92.97.103"
 
 permissions:
   contents: read
+
+concurrency:
+  group: windows-rdp
+  cancel-in-progress: true
 
 jobs:
   windows-rdp:
@@ -35,6 +43,10 @@ jobs:
             Start-Service TermService
           }
 
+          # Disable built-in RDP rules so only the Tailscale rule applies
+          Disable-NetFirewallRule -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue
+
           # Remove previous custom rule
           Get-NetFirewallRule -DisplayName "RDP-Tailscale" `
             -ErrorAction SilentlyContinue |
@@ -48,7 +60,7 @@ jobs:
             -LocalPort 3389 `
             -RemoteAddress "100.64.0.0/10" `
             -Action Allow `
-            -Profile Any
+            -Profile Any | Out-Null
 
           Write-Host "RDP and firewall configured."
 
@@ -75,15 +87,18 @@ jobs:
             $password -cnotmatch '[A-Z]' -or
             $password -cnotmatch '[a-z]' -or
             $password -notmatch '[0-9]' -or
-            $password -notmatch '[^a-zA-Z0-9]' -or
-            $password -match 'RDP'
+            $password -notmatch '[^a-zA-Z0-9]'
           ) {
-            throw "Password must contain uppercase, lowercase, numbers and symbols, and must not contain RDP."
+            throw "Password must contain uppercase, lowercase, numbers and symbols."
+          }
+
+          # -match is case-insensitive: Windows rejects passwords containing the username
+          if ($password -match [regex]::Escape($username)) {
+            throw "Password must not contain the username '$username' (any case)."
           }
 
           Write-Host "Password format validation passed."
 
-          # Display Windows password policy for diagnostics
           Write-Host "=== Windows Password Policy ==="
           net accounts
 
@@ -94,14 +109,10 @@ jobs:
             -String $password -AsPlainText -Force
 
           # Remove existing RDP account
-          $existingUser = Get-LocalUser -Name $username `
-            -ErrorAction SilentlyContinue
-
-          if ($existingUser) {
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
             Remove-LocalUser -Name $username
           }
 
-          # Create account
           try {
             New-LocalUser `
               -Name $username `
@@ -217,11 +228,11 @@ jobs:
 
           Write-Host "Tailscale IP: $tsIP"
 
-      # 5. Diagnose Tailscale connectivity
+      # 5. Diagnose Tailscale connectivity (non-fatal)
       - name: Diagnose Tailscale
         shell: pwsh
         env:
-          CLIENT_TAILSCALE_IP: 100.92.97.103
+          CLIENT_TAILSCALE_IP: ${{ inputs.client_tailscale_ip }}
         run: |
           $ErrorActionPreference = "Continue"
 
@@ -233,13 +244,16 @@ jobs:
           Write-Host "========== TAILSCALE NETCHECK =========="
           & $tailscale netcheck
 
-          Write-Host "========== LOCAL CLIENT PING =========="
-          Write-Host "Testing client: $env:CLIENT_TAILSCALE_IP"
-
-          & $tailscale ping $env:CLIENT_TAILSCALE_IP
+          if (-not [string]::IsNullOrWhiteSpace($env:CLIENT_TAILSCALE_IP)) {
+            Write-Host "========== CLIENT PING =========="
+            Write-Host "Testing client: $env:CLIENT_TAILSCALE_IP"
+            & $tailscale ping -c 3 --until-direct=false --timeout=5s $env:CLIENT_TAILSCALE_IP
+          }
 
           Write-Host "========== TAILSCALE IP =========="
           & $tailscale ip -4
+
+          exit 0
 
       # 6. Verify RDP
       - name: Verify RDP
@@ -249,9 +263,7 @@ jobs:
 
           Write-Host "Checking Remote Desktop service..."
 
-          $service = Get-Service TermService
-
-          if ($service.Status -ne "Running") {
+          if ((Get-Service TermService).Status -ne "Running") {
             throw "Remote Desktop service is not running."
           }
 
@@ -296,4 +308,14 @@ jobs:
           while ($true) {
             Write-Host "[$(Get-Date)] Windows VPS is running..."
             Start-Sleep -Seconds 300
+          }
+
+      # 8. Cleanup (runs even if cancelled or failed)
+      - name: Tailscale logout
+        if: always()
+        shell: pwsh
+        run: |
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $tailscale) {
+            & $tailscale logout
           }
