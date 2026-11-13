@@ -55,7 +55,7 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $username = "RDP"
-          $password = "Rdp@2026!"
+          $password = "Morocco@RDP2026!Secure"
 
           $securePassword = ConvertTo-SecureString `
             $password -AsPlainText -Force
