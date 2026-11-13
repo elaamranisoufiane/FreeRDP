@@ -1,12 +1,12 @@
-name: Windows RDP VPS
+name: Windows RDP over Tailscale
 
 on:
   workflow_dispatch:
     inputs:
       client_tailscale_ip:
-        description: "Tailscale IP of your client device (for connectivity test)"
+        description: "Tailscale IP of your client device (optional, for a connectivity test)"
         required: false
-        default: "100.92.97.103"
+        default: ""
 
 permissions:
   contents: read
@@ -21,13 +21,44 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # 1. Configure Remote Desktop and firewall
+      # 1. Validate secrets before doing anything else
+      - name: Validate secrets
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $key = "$env:TAILSCALE_AUTH_KEY".Trim()
+          if ([string]::IsNullOrWhiteSpace($key)) {
+            throw "TAILSCALE_AUTH_KEY secret is missing."
+          }
+          if ($key -notlike "tskey-auth-*") {
+            throw "TAILSCALE_AUTH_KEY must be an auth key starting with 'tskey-auth-' (not tskey-api- or tskey-client-)."
+          }
+
+          $pw = "$env:RDP_PASSWORD"
+          if ($pw.Length -lt 20) {
+            throw "RDP_PASSWORD must be at least 20 characters."
+          }
+          if ($pw -cnotmatch '[A-Z]' -or
+              $pw -cnotmatch '[a-z]' -or
+              $pw -notmatch '[0-9]' -or
+              $pw -notmatch '[^a-zA-Z0-9]') {
+            throw "RDP_PASSWORD needs uppercase, lowercase, digits and symbols."
+          }
+          if ($pw -match 'RDP') {
+            throw "RDP_PASSWORD must not contain the username 'RDP' (any case)."
+          }
+
+          Write-Host "Secrets look valid."
+
+      # 2. Enable Remote Desktop and restrict the firewall to Tailscale
       - name: Enable Remote Desktop
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-
-          Write-Host "Configuring Remote Desktop..."
 
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
@@ -38,21 +69,16 @@ jobs:
             -Name 'UserAuthentication' -Value 1
 
           Set-Service -Name TermService -StartupType Automatic
-
           if ((Get-Service TermService).Status -ne "Running") {
             Start-Service TermService
           }
 
-          # Disable built-in RDP rules so only the Tailscale rule applies
-          Disable-NetFirewallRule -DisplayGroup "Remote Desktop" `
-            -ErrorAction SilentlyContinue
+          # Disable built-in RDP rules so only Tailscale can reach port 3389
+          Disable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
 
-          # Remove previous custom rule
-          Get-NetFirewallRule -DisplayName "RDP-Tailscale" `
-            -ErrorAction SilentlyContinue |
+          Get-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue |
             Remove-NetFirewallRule
 
-          # Allow RDP only from Tailscale addresses
           New-NetFirewallRule `
             -DisplayName "RDP-Tailscale" `
             -Direction Inbound `
@@ -64,8 +90,8 @@ jobs:
 
           Write-Host "RDP and firewall configured."
 
-      # 2. Create the RDP administrator account
-      - name: Create RDP User
+      # 3. Create the RDP user
+      - name: Create RDP user
         shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
@@ -73,42 +99,8 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $username = "RDP"
-          $password = $env:RDP_PASSWORD
+          $securePassword = ConvertTo-SecureString -String $env:RDP_PASSWORD -AsPlainText -Force
 
-          if ([string]::IsNullOrWhiteSpace($password)) {
-            throw "RDP_PASSWORD secret is missing."
-          }
-
-          if ($password.Length -lt 20) {
-            throw "Use a unique RDP password containing at least 20 characters."
-          }
-
-          if (
-            $password -cnotmatch '[A-Z]' -or
-            $password -cnotmatch '[a-z]' -or
-            $password -notmatch '[0-9]' -or
-            $password -notmatch '[^a-zA-Z0-9]'
-          ) {
-            throw "Password must contain uppercase, lowercase, numbers and symbols."
-          }
-
-          # -match is case-insensitive: Windows rejects passwords containing the username
-          if ($password -match [regex]::Escape($username)) {
-            throw "Password must not contain the username '$username' (any case)."
-          }
-
-          Write-Host "Password format validation passed."
-
-          Write-Host "=== Windows Password Policy ==="
-          net accounts
-
-          $computer = Get-CimInstance Win32_ComputerSystem
-          Write-Host "Computer domain joined: $($computer.PartOfDomain)"
-
-          $securePassword = ConvertTo-SecureString `
-            -String $password -AsPlainText -Force
-
-          # Remove existing RDP account
           if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
             Remove-LocalUser -Name $username
           }
@@ -123,24 +115,24 @@ jobs:
               -ErrorAction Stop | Out-Null
           }
           catch {
-            Write-Host "=== ACCOUNT CREATION ERROR ==="
-            Write-Host $_.Exception.Message
-            Write-Host "Check the Windows password policy and password history."
+            Write-Host "Account creation error: $($_.Exception.Message)"
+            Write-Host "=== Windows password policy ==="
+            net accounts
             throw "Windows rejected the RDP password."
           }
 
           Add-LocalGroupMember -Group "Administrators" -Member $username
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
 
-          Write-Host "RDP account created successfully."
+          Write-Host "RDP account created."
 
-      # 3. Install Tailscale
+      # 4. Install Tailscale
       - name: Install Tailscale
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $installer = "$env:TEMP\tailscale.msi"
+          $installer = Join-Path $env:TEMP "tailscale.msi"
 
           Invoke-WebRequest `
             -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
@@ -156,15 +148,13 @@ jobs:
             throw "Tailscale installation failed: $($process.ExitCode)"
           }
 
-          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          if (-not (Test-Path $tailscale)) {
+          if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
             throw "Tailscale executable not found."
           }
 
-          Write-Host "Tailscale installed successfully."
+          Write-Host "Tailscale installed."
 
-      # 4. Connect to Tailscale
+      # 5. Connect to Tailscale
       - name: Connect Tailscale
         shell: pwsh
         env:
@@ -173,46 +163,33 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $authKey   = "$env:TAILSCALE_AUTH_KEY".Trim()
 
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-            throw "TAILSCALE_AUTH_KEY secret is missing."
-          }
-
-          $service = Get-Service Tailscale -ErrorAction Stop
-
-          if ($service.Status -ne "Running") {
+          if ((Get-Service Tailscale).Status -ne "Running") {
             Start-Service Tailscale
           }
-
           Start-Sleep -Seconds 5
 
-          Write-Host "Connecting to Tailscale..."
-
           & $tailscale up `
-            "--auth-key=$($env:TAILSCALE_AUTH_KEY)" `
+            "--auth-key=$authKey" `
             "--hostname=gh-rdp-$env:GITHUB_RUN_ID" `
             "--unattended" `
             "--accept-dns=false"
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Tailscale connection failed."
+            throw "Tailscale connection failed. Generate a new reusable + ephemeral auth key (tskey-auth-...) and update the secret."
           }
 
-          # Wait for Tailscale IPv4
           $tsIP = $null
-
           for ($i = 1; $i -le 30; $i++) {
             $result = & $tailscale ip -4 2>$null
-
             if ($LASTEXITCODE -eq 0 -and $result) {
               $candidate = ($result | Select-Object -First 1).Trim()
-
               if ($candidate -match '^100\.') {
                 $tsIP = $candidate
                 break
               }
             }
-
             Write-Host "Waiting for Tailscale IP ($i/30)..."
             Start-Sleep -Seconds 2
           }
@@ -222,100 +199,71 @@ jobs:
             throw "Could not obtain Tailscale IP."
           }
 
-          "TAILSCALE_IP=$tsIP" | Out-File `
-            -FilePath $env:GITHUB_ENV `
-            -Append -Encoding utf8
-
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "Tailscale IP: $tsIP"
 
-      # 5. Diagnose Tailscale connectivity (non-fatal)
+      # 6. Diagnostics (never fails the job)
       - name: Diagnose Tailscale
         shell: pwsh
         env:
           CLIENT_TAILSCALE_IP: ${{ inputs.client_tailscale_ip }}
         run: |
           $ErrorActionPreference = "Continue"
-
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          Write-Host "========== TAILSCALE STATUS =========="
           & $tailscale status
-
-          Write-Host "========== TAILSCALE NETCHECK =========="
           & $tailscale netcheck
 
           if (-not [string]::IsNullOrWhiteSpace($env:CLIENT_TAILSCALE_IP)) {
-            Write-Host "========== CLIENT PING =========="
-            Write-Host "Testing client: $env:CLIENT_TAILSCALE_IP"
+            Write-Host "Pinging client $env:CLIENT_TAILSCALE_IP"
             & $tailscale ping -c 3 --until-direct=false --timeout=5s $env:CLIENT_TAILSCALE_IP
           }
 
-          Write-Host "========== TAILSCALE IP =========="
-          & $tailscale ip -4
-
           exit 0
 
-      # 6. Verify RDP
+      # 7. Verify RDP is listening
       - name: Verify RDP
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "Checking Remote Desktop service..."
-
           if ((Get-Service TermService).Status -ne "Running") {
             throw "Remote Desktop service is not running."
           }
 
-          Write-Host "Checking TCP 3389..."
-
-          $listener = Get-NetTCPConnection `
-            -LocalPort 3389 `
-            -State Listen `
-            -ErrorAction SilentlyContinue
-
-          if (-not $listener) {
+          if (-not (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)) {
             throw "Nothing is listening on TCP port 3389."
           }
 
-          $test = Test-NetConnection 127.0.0.1 `
-            -Port 3389 `
-            -WarningAction SilentlyContinue
-
+          $test = Test-NetConnection 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
           if (-not $test.TcpTestSucceeded) {
             throw "Local RDP port test failed."
           }
 
-          Write-Host "RDP is ready."
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "RDP is ready on $env:TAILSCALE_IP"
 
-      # 7. Keep runner active
-      - name: Keep Windows VPS Running
+      # 8. Keep the runner alive
+      - name: Keep runner alive
         shell: pwsh
-        env:
-          RDP_USERNAME: RDP
         run: |
-          Write-Host ""
           Write-Host "======================================"
-          Write-Host "       WINDOWS RDP VPS READY"
+          Write-Host "         WINDOWS RDP READY"
           Write-Host "======================================"
           Write-Host "Address:  $env:TAILSCALE_IP"
-          Write-Host "Username: .\$env:RDP_USERNAME"
-          Write-Host "Password: GitHub RDP_PASSWORD secret"
+          Write-Host "Username: .\RDP"
+          Write-Host "Password: the RDP_PASSWORD secret"
           Write-Host "Port:     3389"
           Write-Host "======================================"
 
           while ($true) {
-            Write-Host "[$(Get-Date)] Windows VPS is running..."
+            Write-Host "[$(Get-Date -Format s)] running..."
             Start-Sleep -Seconds 300
           }
 
-      # 8. Cleanup (runs even if cancelled or failed)
+      # 9. Cleanup, even on cancel or failure
       - name: Tailscale logout
         if: always()
         shell: pwsh
         run: |
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          if (Test-Path $tailscale) {
-            & $tailscale logout
-          }
+          if (Test-Path $tailscale) { & $tailscale logout }
