@@ -13,28 +13,26 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # 1. Configure Windows Remote Desktop
+
+      # 1. Enable Remote Desktop
       - name: Enable Remote Desktop
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Enable RDP
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name 'fDenyTSConnections' -Value 0
 
-          # Keep Network Level Authentication enabled
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name 'UserAuthentication' -Value 1
 
-          # Disable existing broad RDP firewall rules
+          # Enable firewall rule only for Tailscale addresses
           Get-NetFirewallRule -DisplayGroup "Remote Desktop" `
             -ErrorAction SilentlyContinue |
             Disable-NetFirewallRule
 
-          # Allow RDP only from the Tailscale IPv4 range
           Remove-NetFirewallRule -DisplayName "RDP-Tailscale" `
             -ErrorAction SilentlyContinue
 
@@ -47,46 +45,45 @@ jobs:
             -Action Allow `
             -Profile Any
 
-          # Ensure the RDP service is running
-          Set-Service -Name TermService -StartupType Automatic
-          Start-Service -Name TermService
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService
 
-      # 2. Create the RDP administrator account
+      # 2. Generate RDP credentials
       - name: Create RDP User
+        id: credentials
         shell: pwsh
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD) -or
-              $env:RDP_PASSWORD.Length -lt 16) {
-              throw "RDP_PASSWORD must contain at least 16 characters."
-          }
+          # Generate a cryptographically random password
+          $bytes = New-Object byte[] 24
+          $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+          $rng.GetBytes($bytes)
+
+          $password = [Convert]::ToBase64String($bytes).
+            TrimEnd('=').Replace('+','A').Replace('/','B')
+
+          $rng.Dispose()
 
           $securePassword = ConvertTo-SecureString `
-            $env:RDP_PASSWORD -AsPlainText -Force
-
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
-              Remove-LocalUser -Name "RDP"
-          }
+            $password -AsPlainText -Force
 
           New-LocalUser `
             -Name "RDP" `
             -Password $securePassword `
             -Description "Temporary RDP administrator" `
-            -AccountNeverExpires `
-            -PasswordNeverExpires
+            -AccountNeverExpires
 
-          Add-LocalGroupMember `
-            -Group "Administrators" `
-            -Member "RDP"
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
 
-          Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member "RDP"
+          # Mask password and expose it as a step output
+          Write-Output "::add-mask::$password"
 
-          Write-Host "RDP administrator created successfully."
+          "rdp_username=RDP" >> $env:GITHUB_OUTPUT
+          "rdp_password=$password" >> $env:GITHUB_OUTPUT
+
+          Write-Host "RDP account created successfully."
 
       # 3. Install Tailscale
       - name: Install Tailscale
@@ -109,12 +106,12 @@ jobs:
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
           if (!(Test-Path $tailscale)) {
-              throw "Tailscale installation failed."
+            throw "Tailscale installation failed."
           }
 
           Write-Host "Tailscale installed successfully."
 
-      # 4. Connect to your Tailscale network
+      # 4. Connect Tailscale
       - name: Connect Tailscale
         shell: pwsh
         env:
@@ -125,7 +122,7 @@ jobs:
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-              throw "TAILSCALE_AUTH_KEY is missing."
+            throw "TAILSCALE_AUTH_KEY is missing."
           }
 
           & $tailscale up `
@@ -133,42 +130,39 @@ jobs:
             "--hostname=gh-rdp-$env:GITHUB_RUN_ID"
 
           if ($LASTEXITCODE -ne 0) {
-              throw "Failed to connect to Tailscale."
+            throw "Tailscale connection failed."
           }
 
-          # Retrieve the assigned IPv4 address
           $tsIP = $null
 
           for ($i = 0; $i -lt 20; $i++) {
-              $tsIP = (& $tailscale ip -4 | Select-Object -First 1).Trim()
+            $tsIP = (& $tailscale ip -4 | Select-Object -First 1).Trim()
 
-              if ($tsIP -match '^100\.') {
-                  break
-              }
+            if ($tsIP -match '^100\.') {
+              break
+            }
 
-              Start-Sleep -Seconds 5
+            Start-Sleep -Seconds 5
           }
 
           if ($tsIP -notmatch '^100\.') {
-              throw "Tailscale IP assignment failed."
+            throw "Tailscale IP assignment failed."
           }
 
           "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
           Write-Host "Tailscale connected successfully."
 
-      # 5. Verify RDP service
+      # 5. Verify RDP
       - name: Verify RDP
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "Checking RDP service..."
-
           $service = Get-Service TermService
 
           if ($service.Status -ne "Running") {
-              throw "Remote Desktop service is not running."
+            throw "RDP service is not running."
           }
 
           $test = Test-NetConnection `
@@ -177,27 +171,36 @@ jobs:
             -WarningAction SilentlyContinue
 
           if (!$test.TcpTestSucceeded) {
-              throw "RDP port 3389 is not responding."
+            throw "RDP port 3389 is not responding."
           }
 
           Write-Host "RDP service is ready."
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
 
-      # 6. Maintain the RDP session
-      - name: Keep Windows VPS Running
+      # 6. Display connection information
+      - name: RDP Connection Information
         shell: pwsh
+        env:
+          RDP_USERNAME: ${{ steps.credentials.outputs.rdp_username }}
+          RDP_PASSWORD: ${{ steps.credentials.outputs.rdp_password }}
         run: |
           Write-Host ""
-          Write-Host "======================================"
-          Write-Host "       WINDOWS RDP VPS READY"
-          Write-Host "======================================"
-          Write-Host "Address:  $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: Your RDP_PASSWORD secret"
-          Write-Host "Port:     3389"
-          Write-Host "======================================"
+          Write-Host "========================================"
+          Write-Host "         WINDOWS RDP VPS READY"
+          Write-Host "========================================"
+          Write-Host "IP ADDRESS : $env:TAILSCALE_IP"
+          Write-Host "USERNAME   : $env:RDP_USERNAME"
+          Write-Host "PASSWORD   : MASKED FOR SECURITY"
+          Write-Host "PORT       : 3389"
+          Write-Host "========================================"
+
+      # 7. Keep VPS running
+      - name: Maintain RDP Connection
+        shell: pwsh
+        run: |
+          Write-Host "Windows RDP VPS is running."
 
           while ($true) {
-              Write-Host "[$(Get-Date)] Windows VPS is running..."
-              Start-Sleep -Seconds 300
+            Write-Host "[$(Get-Date)] RDP Active..."
+            Start-Sleep -Seconds 300
           }
