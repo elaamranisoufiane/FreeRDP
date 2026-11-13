@@ -1,0 +1,206 @@
+
+name: Windows RDP VPS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+
+      # 1. Enable Remote Desktop
+      - name: Enable Remote Desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' -Value 1
+
+          # Enable firewall rule only for Tailscale addresses
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
+          Remove-NetFirewallRule -DisplayName "RDP-Tailscale" `
+            -ErrorAction SilentlyContinue
+
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Action Allow `
+            -Profile Any
+
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService
+
+      # 2. Generate RDP credentials
+      - name: Create RDP User
+        id: credentials
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Generate a cryptographically random password
+          $bytes = New-Object byte[] 24
+          $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+          $rng.GetBytes($bytes)
+
+          $password = [Convert]::ToBase64String($bytes).
+            TrimEnd('=').Replace('+','A').Replace('/','B')
+
+          $rng.Dispose()
+
+          $securePassword = ConvertTo-SecureString `
+            $password -AsPlainText -Force
+
+          New-LocalUser `
+            -Name "RDP" `
+            -Password $securePassword `
+            -Description "Temporary RDP administrator" `
+            -AccountNeverExpires
+
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          # Mask password and expose it as a step output
+          Write-Output "::add-mask::$password"
+
+          "rdp_username=RDP" >> $env:GITHUB_OUTPUT
+          "rdp_password=$password" >> $env:GITHUB_OUTPUT
+
+          Write-Host "RDP account created successfully."
+
+      # 3. Install Tailscale
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installer = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $installer
+
+          Start-Process msiexec.exe `
+            -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" `
+            -Wait
+
+          Remove-Item $installer -Force
+
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (!(Test-Path $tailscale)) {
+            throw "Tailscale installation failed."
+          }
+
+          Write-Host "Tailscale installed successfully."
+
+      # 4. Connect Tailscale
+      - name: Connect Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "TAILSCALE_AUTH_KEY is missing."
+          }
+
+          & $tailscale up `
+            "--authkey=$env:TAILSCALE_AUTH_KEY" `
+            "--hostname=gh-rdp-$env:GITHUB_RUN_ID"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale connection failed."
+          }
+
+          $tsIP = $null
+
+          for ($i = 0; $i -lt 20; $i++) {
+            $tsIP = (& $tailscale ip -4 | Select-Object -First 1).Trim()
+
+            if ($tsIP -match '^100\.') {
+              break
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+          if ($tsIP -notmatch '^100\.') {
+            throw "Tailscale IP assignment failed."
+          }
+
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+          Write-Host "Tailscale connected successfully."
+
+      # 5. Verify RDP
+      - name: Verify RDP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $service = Get-Service TermService
+
+          if ($service.Status -ne "Running") {
+            throw "RDP service is not running."
+          }
+
+          $test = Test-NetConnection `
+            -ComputerName "127.0.0.1" `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          if (!$test.TcpTestSucceeded) {
+            throw "RDP port 3389 is not responding."
+          }
+
+          Write-Host "RDP service is ready."
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+      # 6. Display connection information
+      - name: RDP Connection Information
+        shell: pwsh
+        env:
+          RDP_USERNAME: ${{ steps.credentials.outputs.rdp_username }}
+          RDP_PASSWORD: ${{ steps.credentials.outputs.rdp_password }}
+        run: |
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "         WINDOWS RDP VPS READY"
+          Write-Host "========================================"
+          Write-Host "IP ADDRESS : $env:TAILSCALE_IP"
+          Write-Host "USERNAME   : $env:RDP_USERNAME"
+          Write-Host "PASSWORD   : MASKED FOR SECURITY"
+          Write-Host "PORT       : 3389"
+          Write-Host "========================================"
+
+      # 7. Keep VPS running
+      - name: Maintain RDP Connection
+        shell: pwsh
+        run: |
+          Write-Host "Windows RDP VPS is running."
+
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP Active..."
+            Start-Sleep -Seconds 300
+          }
